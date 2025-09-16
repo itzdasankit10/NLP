@@ -1,22 +1,21 @@
 import asyncio
+import json
 import re
+import os
 from io import BytesIO
-from typing import List, Dict, Any
+from typing import Dict, List
 
 import ollama
-import torch
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.styles import getSampleStyleSheet
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
 from sentence_transformers import SentenceTransformer, util
 from transformers import pipeline
 
-
-# --- App Initialization ---
 app = FastAPI()
 
 app.add_middleware(
@@ -27,101 +26,125 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- AI Model Loading (Consolidated and CPU-forced) ---
 print("Configuring all Hugging Face models to use device: cpu")
-aclient = ollama.AsyncClient()
-qa_pipe = pipeline("question-answering", model="distilbert-base-cased-distilled-squad", device='cpu')
-st_model = SentenceTransformer("all-MiniLM-L6-v2", device='cpu')
+a = ollama.AsyncClient()
+b = pipeline("question-answering", model="distilbert-base-cased-distilled-squad", device='cpu')
+c = SentenceTransformer("all-MiniLM-L6-v2", device='cpu')
 
+BOOKS_BASE_DIR = "BOOKS"
+SUBJECT_ABBREVIATIONS = {
+    "Geography": "geo",
+    "History": "his",
+    "Economics": "eco",
+    "English": "eng",
+    "Biology": "bio",
+    "Political Science": "pol"
+}
 
-# --- Pydantic Models for API Requests & Responses ---
-class ContextRequest(BaseModel):
-    context: str
+class QuestionCounts(BaseModel):
+    mcqs: int
+    fill_in_the_blanks: int
+    subjective: int
 
 class QuestionItem(BaseModel):
     question: str
     answer: str | None = None
 
-class AnswerRequest(BaseModel):
-    context: str
+class QuestionsPayload(BaseModel):
     questions: Dict[str, List[QuestionItem]]
-
-class EvaluationRequest(BaseModel):
-    context: str
-    question: str
-    generated_answer: str
-    q_type: str 
 
 class PdfRequest(BaseModel):
     answered_questions: Dict[str, List[QuestionItem]]
 
+def get_context_from_selection(class_num: str, subject: str) -> str:
+    subject_abbr = SUBJECT_ABBREVIATIONS.get(subject)
+    if not subject_abbr:
+        raise HTTPException(status_code=404, detail=f"Subject '{subject}' is not configured.")
 
-# --- API Endpoints ---
+    class_dir = os.path.join(BOOKS_BASE_DIR, f"CLASS {class_num}")
+    if not os.path.isdir(class_dir):
+        raise HTTPException(status_code=404, detail=f"Directory for Class {class_num} not found.")
+
+    file_prefix = f"class_{class_num}_{subject_abbr}"
+    found_file_path = None
+    try:
+        for filename in os.listdir(class_dir):
+            if filename.startswith(file_prefix) and filename.endswith(".txt"):
+                found_file_path = os.path.join(class_dir, filename)
+                break
+    except FileNotFoundError:
+         raise HTTPException(status_code=404, detail=f"Base directory '{BOOKS_BASE_DIR}' not found.")
+
+    if not found_file_path:
+        raise HTTPException(status_code=404, detail=f"Textbook file for Class {class_num}, Subject {subject} not found.")
+
+    try:
+        with open(found_file_path, 'r', encoding='utf-8') as f:
+            return f.read()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error reading file '{found_file_path}': {e}")
+
 @app.post("/generate-questions")
-async def generate_questions(req: ContextRequest):
-    ctx = req.context
+async def generate_questions(
+    class_num: str = Form(...),
+    subject: str = Form(...),
+    counts_json: str = Form(...)
+):
+    ctx = get_context_from_selection(class_num, subject)
     if not ctx:
-        raise HTTPException(status_code=400, detail="No context provided.")
+        raise HTTPException(status_code=400, detail="The selected textbook file is empty.")
+
+    try:
+        counts = QuestionCounts.model_validate_json(counts_json)
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON for question counts: {e}")
 
     p = f"""
 You are an assistant that generates a three-part quiz from the provided text. Follow these instructions exactly.
-
 **Input Text:**
 ---
 {ctx}
 ---
-
 **Instructions:**
 Generate a quiz with exactly three distinct parts below. Use the specified headers for each part. Do not add any extra conversation, introductions, or concluding text.
-
 **Part 1: Multiple Choice Questions**
-Generate exactly 5 MCQs. Each question must have four options (A, B, C, D).
+Generate exactly {counts.mcqs} MCQs. Each question must have four options (A, B, C, D).
 Do NOT include the correct answer.
-
 **Part 2: Fill in the Blanks**
-Generate exactly 5 fill-in-the-blanks questions. Replace a key word or phrase with '____'.
+Generate exactly {counts.fill_in_the_blanks} fill-in-the-blanks questions. Replace a key word or phrase with '____'.
 The question must be a complete sentence. Do NOT include the answer.
-
 **Part 3: Subjective Questions**
-Generate exactly 5 subjective (long-answer) questions that encourage critical thinking about the text.
-
+Generate exactly {counts.subjective} subjective (long-answer) questions that encourage critical thinking about the text.
 **IMPORTANT:** You must generate all three parts and use the exact "Part X:" headers. Do not stop generating until all three sections are fully complete.
 """
     try:
-        r = await aclient.generate(model="llama3.1", prompt=p)
+        r = await a.generate(model="llama3.1", prompt=p)
         t = r["response"].strip()
         
         d = {"mcqs": [], "fill_in_the_blanks": [], "subjective": []}
         parts = re.split(r'part\s+\d+:', t, flags=re.IGNORECASE)
 
         if len(parts) > 1:
-            c = parts[1]
-            c = re.sub(r'.*multiple\s+choice\s+questions.*?\n', '', c, flags=re.IGNORECASE).strip()
-            q_blocks = re.split(r'\n\s*(?=\d+\.\s*|Q:)', c)
+            content = parts[1]
+            content = re.sub(r'.*multiple\s+choice\s+questions.*?\n', '', content, flags=re.IGNORECASE).strip()
+            q_blocks = re.split(r'\n\s*(?=\d+\.\s*|Q:)', content)
             d["mcqs"] = [{"question": q.strip(), "answer": ""} for q in q_blocks if q.strip()]
 
-        # --- THIS IS THE CORRECTED PART ---
         if len(parts) > 2:
-            c = parts[2]
-            c = re.sub(r'.*fill\s+in\s+the\s+blanks.*?\n', '', c, flags=re.IGNORECASE).strip()
-            
-            # New robust logic: Split only at the start of a new numbered question
-            q_blocks = re.split(r'\n\s*(?=\d+\.)', c)
-            
+            content = parts[2]
+            content = re.sub(r'.*fill\s+in\s+the\s+blanks.*?\n', '', content, flags=re.IGNORECASE).strip()
+            q_blocks = re.split(r'\n\s*(?=\d+\.)', content)
             temp_list = []
             for block in q_blocks:
-                # Join multi-line questions and clean up whitespace
                 clean_q = " ".join(block.strip().splitlines()).strip("0123456789. ").strip()
                 if clean_q:
                     temp_list.append({"question": clean_q, "answer": ""})
             d["fill_in_the_blanks"] = temp_list
-        # --- END OF CORRECTION ---
 
         if len(parts) > 3:
-            c = parts[3]
-            c = re.sub(r'.*subjective\s+questions.*?\n', '', c, flags=re.IGNORECASE).strip()
-            # This logic is already robust, so no changes are needed here.
-            q_blocks = re.split(r'\n\s*(?=\d+\.)', c)
+            content = parts[3]
+            content = re.sub(r'.*subjective\s+questions.*?\n', '', content, flags=re.IGNORECASE).strip()
+            q_blocks = re.split(r'\n\s*(?=\d+\.)', content)
             temp_list = []
             for block in q_blocks:
                 clean_q = " ".join(block.strip().splitlines()).strip("0123456789. ").strip()
@@ -136,19 +159,26 @@ Generate exactly 5 subjective (long-answer) questions that encourage critical th
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Question generation failed: {str(e)}")
 
+
 @app.post("/generate-answers")
-async def generate_answers(req: AnswerRequest):
-    ctx = req.context
-    q_data = req.questions
+async def generate_answers(
+    questions_json: str = Form(...),
+    class_num: str = Form(...),
+    subject: str = Form(...)
+):
+    ctx = get_context_from_selection(class_num, subject)
+    try:
+        q_data = QuestionsPayload.model_validate_json(questions_json).questions
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON format for questions: {e}")
+
     answered_data = {"mcqs": [], "fill_in_the_blanks": [], "subjective": []}
 
     for q_type, q_list in q_data.items():
         if not q_list:
             continue
 
-        prompts = []
-        for i, item in enumerate(q_list):
-            prompts.append(f"{i+1}. {item.question}")
+        prompts = [f"{i+1}. {item.question}" for i, item in enumerate(q_list)]
         joined_prompts = "\n".join(prompts)
         
         p_template = ""
@@ -157,9 +187,9 @@ async def generate_answers(req: AnswerRequest):
         elif q_type == "fill_in_the_blanks":
             p_template = f"Context:\n{ctx}\n\nFor each question below, provide ONLY the single word or short phrase that fits in the blank, each on a new line.\n\n{joined_prompts}"
         else:
-             p_template = f"Context:\n{ctx}\n\nAnswer each of the following questions in detail. Start each answer with the corresponding number (e.g., '1. [Answer text]').\n\n{joined_prompts}"
+            p_template = f"Context:\n{ctx}\n\nAnswer each of the following questions in detail. Start each answer with the corresponding number (e.g., '1. [Answer text]').\n\n{joined_prompts}"
 
-        r = await aclient.generate(model="llama3.1", prompt=p_template)
+        r = await a.generate(model="llama3.1", prompt=p_template)
         raw_answers = r["response"].strip()
         
         raw_answers = re.sub(r'^(.*?)(?=1\.)', '', raw_answers, flags=re.DOTALL)
@@ -167,13 +197,12 @@ async def generate_answers(req: AnswerRequest):
         
         temp_list = []
         for i, item in enumerate(q_list):
-            new_item = item.model_copy()
             if i < len(split_answers) and split_answers[i].strip():
                 answer_text = re.sub(r'^\d+\.\s*', '', split_answers[i].strip())
-                new_item.answer = answer_text
+                item.answer = answer_text
             else:
-                new_item.answer = "No answer generated."
-            temp_list.append(new_item)
+                item.answer = "No answer generated."
+            temp_list.append(item)
         
         answered_data[q_type] = temp_list
         
@@ -181,38 +210,95 @@ async def generate_answers(req: AnswerRequest):
 
 
 @app.post("/evaluate-accuracy")
-async def evaluate_accuracy(req: EvaluationRequest):
-    if not req.context:
-        raise HTTPException(status_code=400, detail="No context is set.")
+async def evaluate_accuracy(
+    question: str = Form(...),
+    generated_answer: str = Form(...),
+    q_type: str = Form(...),
+    class_num: str = Form(...),
+    subject: str = Form(...)
+):
+    ctx = get_context_from_selection(class_num, subject)
 
-    if req.q_type == "subjective":
-        emb1 = st_model.encode(req.context, convert_to_tensor=True)
-        emb2 = st_model.encode(req.generated_answer, convert_to_tensor=True)
+    if q_type == "subjective":
+        emb1 = c.encode(ctx, convert_to_tensor=True)
+        emb2 = c.encode(generated_answer, convert_to_tensor=True)
         sim = util.pytorch_cos_sim(emb1, emb2)
         score = sim.item()
         return {
-            "generated_answer": req.generated_answer,
+            "generated_answer": generated_answer,
             "bert_answer": "N/A (Relevance Score)",
             "similarity_score": score
         }
     else:
         loop = asyncio.get_running_loop()
         bert_result = await loop.run_in_executor(
-            None, qa_pipe, req.question, req.context
+            None, b, question, ctx
         )
         bert_answer = bert_result["answer"]
 
-        emb1 = st_model.encode(req.generated_answer, convert_to_tensor=True)
-        emb2 = st_model.encode(bert_answer, convert_to_tensor=True)
+        emb1 = c.encode(generated_answer, convert_to_tensor=True)
+        emb2 = c.encode(bert_answer, convert_to_tensor=True)
         
         sim = util.pytorch_cos_sim(emb1, emb2)
         score = sim.item()
         return {
-            "generated_answer": req.generated_answer,
+            "generated_answer": generated_answer,
             "bert_answer": bert_answer,
             "similarity_score": score
         }
-    
+
+@app.post("/regenerate-answer")
+async def regenerate_answer(
+    class_num: str = Form(...),
+    subject: str = Form(...),
+    question: str = Form(...),
+    original_answer: str = Form(...),
+    human_evaluation: str = Form(...),
+    bert_answer: str = Form(...),
+    q_type: str = Form(...)
+):
+    # For simple questions, the BERT answer is the best answer. Use it directly.
+    if q_type in ["mcqs", "fill_in_the_blanks"]:
+        return {"new_answer": bert_answer}
+
+    # For subjective questions, we need the LLM to generate a better paragraph.
+    elif q_type == "subjective":
+        ctx = get_context_from_selection(class_num, subject)
+        p = f"""
+You are an expert teaching assistant tasked with correcting a detailed, subjective answer.
+Your goal is to generate a new answer that is well-written, comprehensive, and factually correct based on the text.
+
+**Full Context:**
+---
+{ctx}
+---
+
+**Question:**
+{question}
+
+**Previous Flawed Answer:**
+"{original_answer}"
+
+**Human Feedback:**
+The previous answer was marked as: **{human_evaluation}**.
+
+**Your Task:**
+Generate a new, improved, and comprehensive answer to the subjective question. Base your new answer on the full context and ensure it is accurate and detailed.
+
+**Output:**
+Provide ONLY the new, corrected answer.
+"""
+        try:
+            r = await a.generate(model="llama3.1", prompt=p)
+            new_answer = r["response"].strip()
+            if not new_answer:
+                raise HTTPException(status_code=500, detail="Model failed to regenerate an answer.")
+            return {"new_answer": new_answer}
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"Answer regeneration failed: {str(e)}")
+
+    else:
+        raise HTTPException(status_code=400, detail=f"Unknown question type for regeneration: {q_type}")
 
 @app.post("/answer-questions-pdf")
 async def answer_questions_pdf(req: PdfRequest):
