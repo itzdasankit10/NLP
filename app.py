@@ -379,13 +379,7 @@ def chunk_text_for_gpt2(text: str, approx_chunk_chars: int = 1800) -> List[str]:
     return chunks
 
 async def _run_llm_call(model_name: str, prompt: str, max_tokens: int = 1024) -> str:
-    """
-    Unified call handler:
-    - OpenAI chat models: uses OpenAI async client f
-    - gpt2 (local HF pipeline): uses run_in_executor with lambda wrapper (no unexpected kwargs)
-    - Ollama: uses async client a
-    - T5: Uses local pipeline e
-    """
+    
     t = ""
     if model_name.startswith("gpt-"):
         if not f:
